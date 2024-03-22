@@ -4,7 +4,7 @@ Source codes for "Multi-agent reinforcement learning using echo-state network an
 
 Requires numpy, scipy, and Pillow.
 
-Note: Codes of deep reinforcement learning(DRL) algorithms stored in 'DRL_algorithms' requires Pytorch, instead of scipy.
+Note: Codes of deep reinforcement learning (DRL) algorithms stored in 'DRL_algorithms' require Pytorch, instead of scipy.
 
 Most of hyperparameters are given in class 'hyperparameters'.
 
