@@ -18,7 +18,7 @@ Whether parameter sharing is adopted or not is decided by Env.experience_sharing
 
 
 # Credits
-[Added on 2025-08-10 to increase transparency.]
+[Added on 2025-07-31 to increase transparency.]
 The deep learning codes used for comparison were influenced by multiple open-source implementations, including:
 
 - https://github.com/ikostrikov/pytorch-a3c (MIT license)
