@@ -21,8 +21,8 @@ Whether parameter sharing is adopted or not is decided by Env.experience_sharing
 [Added on 2025-08-10 to increase transparency.]
 The deep learning codes used for comparison were influenced by multiple open-source implementations, including:
 
-- https://github.com/ikostrikov/pytorch-a3c  
-- https://github.com/nikhilbarhate99/PPO-PyTorch  
+- https://github.com/ikostrikov/pytorch-a3c (MIT license)
+- https://github.com/nikhilbarhate99/PPO-PyTorch (MIT license)
 
 In particular, the function `memory_sample` in pedestrian_task1_DQN.py and pedestrian_task2_DQN.py is based on the following implementation:
 
