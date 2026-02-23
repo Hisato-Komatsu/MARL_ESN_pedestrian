@@ -1,15 +1,12 @@
 """
 Source code for task.I
-2024/2/15 modified the calculation method of matrix A
-2025/9/5 changed activation function into tanh
-2025/9/29 improved the forward propagation to save the computational time
-2026/1/12 improved efficiency of the forward propagation
+2024/9/28 random action agents used for the comparison of computational cost 
+2026/1/16 improved the action choosing
 """
 import numpy as np
 import time
 import copy
 from PIL import Image
-from scipy.sparse import csc_matrix
 
 start_time = time.time()
 #np.set_printoptions(precision=3) # used for debugging
@@ -31,25 +28,11 @@ class hyperparameters:
       self.n_agent = 1 #the number of agents
       self.agent_eyesight_whole = 11 #odd number
 
-      self.gamma = 0.95
-      self.reservoir_size = 1024
-      self.sparsity=0.9 #p^{in} _{s3}, p^{in} _{sb}, and p^{res} _s
-      self.central_sparsity = 0.8 #p^{in} _{s2}
-      self.core_sparsity = 0.6 #p^{in} _{s1} 
-      self.beta = 0.0001 #Ridge term
-      self.epsilon = 1.0 #epsilon-greedy
-      self.epsilon_decay = 0.95
-      self.epsilon_min = 0.02
-      self.decay_ratio = 0.95 #decay of memory matrices per one update of W_out
- 
-      self.sigma_W_in_a = 2.0 #stddev of W_in_a
-
 
 class Env:
    def __init__(self, hyperparameters, render_mode='off'):
       #render_mode : 'off' or 'rgb_array'
       self.render_mode = render_mode
-      # This code assumes experience_sharing.
       if self.render_mode == 'rgb_array' :
          self.Image_list = []
 
@@ -63,7 +46,6 @@ class Env:
       self.move_candidate_number = np.zeros((self.width,self.height)).astype(int)
       self.n_agent = self.hyperparameters.n_agent
       self.done = False
-      self.epsilon_min = self.hyperparameters.epsilon_min
 
       self.build_wall()
 
@@ -77,8 +59,6 @@ class Env:
          self.agents.append(new_agent)
          self.condition[new_agent.pos[0]][new_agent.pos[1]] = condition_dict["agent"]
          self.view[new_agent.pos[0]][new_agent.pos[1]][0] = self.agents[i_agent].color
-
-      self.agents[0].make_neunet()
 
    def agent_position(self, i_agent):
       if i_agent <= 19 :
@@ -127,21 +107,12 @@ class Env:
          self.view[self.agents[i_agent].pos[0]][self.agents[i_agent].pos[1]][0] = self.agents[i_agent].color
 
    def _step(self, t):
-      if t >= 1:
-         whole_Xi_temp_part0 = self.whole_Xi_temp_part1
-         whole_reward_past = self.whole_reward
-
       #agents' action
-      # getting batched observation 
-      whole_pos_x = np.array([agent.pos[0] for agent in self.agents]) 
-      whole_pos_y = np.array([agent.pos[1] for agent in self.agents]) 
-      x_id_batch = (whole_pos_x[:, None] + self.agents[0].offset[None, :]) % self.width
-      y_id_batch = (whole_pos_y[:, None] + self.agents[0].offset[None, :]) % self.height
-      state_array = self.view[x_id_batch[:, :, None], y_id_batch[:, None, :]].reshape(-1, self.agents[0].state_size)
+      whole_action = self.agents[0].choose_action(self.n_agent)
 
-      self.whole_action, self.whole_Xi_temp_part1 = self.agents[0].choose_action(state_array)
       for i_agent in range(self.n_agent):
-         self.agents[i_agent].action = self.whole_action[i_agent]
+
+         self.agents[i_agent].action = whole_action[i_agent]
          self.agents[i_agent]._step(self.agents[i_agent].action)
          self.move_candidate_number[self.agents[i_agent].new_pos[0]][self.agents[i_agent].new_pos[1]] += 1            
          
@@ -150,7 +121,6 @@ class Env:
          if self.condition[self.agents[i_agent].new_pos[0]][self.agents[i_agent].new_pos[1]] == condition_dict["vacant"] and self.move_candidate_number[self.agents[i_agent].new_pos[0]][self.agents[i_agent].new_pos[1]] == 1 :
             self.agents[i_agent].move_permission = 'yes'
 
-      self.whole_reward = []
       for i_agent in range(self.n_agent):
          #update of the position of agents
          if self.agents[i_agent].move_permission == 'yes' :
@@ -164,45 +134,8 @@ class Env:
             self.view[self.agents[i_agent].pos[0]][self.agents[i_agent].pos[1]][0] = self.agents[i_agent].color
             self.agents[i_agent].reward = 0.0
 
-         self.whole_reward.append(self.agents[i_agent].reward)
          self.agents[i_agent].total_reward += self.agents[i_agent].reward
          self.agents[i_agent].move_permission = 'no'
-
-      #update of memory matrices
-      if t >= 1 :
-         whole_Xi_temp = whole_Xi_temp_part0 - self.agents[0].gamma*self.whole_Xi_temp_part1
-
-         self.agents[0].reward_list.append(whole_reward_past)
-         self.agents[0].Xi_temp_list.append(whole_Xi_temp)
-         self.agents[0].Xi_temp_p0_list.append(whole_Xi_temp_part0)
-
-      if self.done:
-         #calculation on the last step
-         # getting batched observation 
-         whole_pos_x = np.array([agent.pos[0] for agent in self.agents]) 
-         whole_pos_y = np.array([agent.pos[1] for agent in self.agents]) 
-         x_id_batch = (whole_pos_x[:, None] + self.agents[0].offset[None, :]) % self.width
-         y_id_batch = (whole_pos_y[:, None] + self.agents[0].offset[None, :]) % self.height
-         state_array = self.view[x_id_batch[:, :, None], y_id_batch[:, None, :]].reshape(-1, self.agents[0].state_size)
-
-         whole_reward_past = self.whole_reward
-         whole_Xi_temp_part0 = self.whole_Xi_temp_part1
-
-         self.whole_action, self.whole_Xi_temp_part1 = self.agents[0].choose_action(state_array)
-         whole_Xi_temp = whole_Xi_temp_part0 - self.agents[0].gamma*self.whole_Xi_temp_part1
-
-         self.agents[0].reward_list.append(whole_reward_past)
-         self.agents[0].Xi_temp_list.append(whole_Xi_temp)
-         self.agents[0].Xi_temp_p0_list.append(whole_Xi_temp_part0) 
-
-         self.agents[0].reward_list.append([0.0 for _ in range(self.n_agent)])
-         self.agents[0].Xi_temp_list.append(self.whole_Xi_temp_part1)
-         self.agents[0].Xi_temp_p0_list.append(self.whole_Xi_temp_part1)
-
-         self.agents[0].calculate_Wout()
-
-         if self.agents[0].epsilon > self.epsilon_min:
-            self.agents[0].epsilon *= self.agents[0].epsilon_decay
 
       #resetting move_candidate_number
       self.move_candidate_number = np.zeros((self.width,self.height)).astype(int)
@@ -232,49 +165,9 @@ class Agent(Object):
       self.width = self.hyperparameters.width
       self.height = self.hyperparameters.height
       self.move_permission = 'no'
-      self.total_reward = 0.0
-
-   def make_neunet(self): # lazy initialization for particular agents' attribute
-      self.agent_eyesight_whole = self.hyperparameters.agent_eyesight_whole 
-      self.agent_eyesight_1side = self.agent_eyesight_whole//2
-      self.state_size = self.agent_eyesight_whole*self.agent_eyesight_whole*2
-      self.offset = np.arange(-self.agent_eyesight_1side, self.agent_eyesight_1side + 1)
       self.action_size = 4
-      self.sparsity = self.hyperparameters.sparsity
-      self.central_sparsity = self.hyperparameters.central_sparsity
-      self.core_sparsity = self.hyperparameters.core_sparsity
-      self.gamma = self.hyperparameters.gamma
-      self.beta = self.hyperparameters.beta # Ridge term 
-      self.reservoir_size = self.hyperparameters.reservoir_size
-      self.reservoir_output_size = self.reservoir_size + 1
-      self.epsilon = self.hyperparameters.epsilon #epsilon-greedy
-      self.epsilon_decay = self.hyperparameters.epsilon_decay
-      self.decay_ratio = self.hyperparameters.decay_ratio #decay of memory matrices per one update of W_out
 
-      self.reward_list = []
-      self.Xi_temp_list = []
-      self.Xi_temp_p0_list = []
-
-      self.sigma_W_in_a = self.hyperparameters.sigma_W_in_a
-
-      self.W_in_s = np.random.normal(loc=0.0,scale=1.0,size=(self.reservoir_size,self.state_size+1))
-      self.W_in_a = np.random.normal(loc=0.0,scale=self.sigma_W_in_a,size=(self.reservoir_size,self.action_size))
-      self.W_out = np.zeros((self.reservoir_output_size,))
-
-      Cut_prob_W_in_s = np.random.uniform(low=0.0,high=1.0,size=(self.reservoir_size,self.state_size+1))
-
-      Cut_prob_mat = self.sparsity * np.ones( (self.agent_eyesight_whole,self.agent_eyesight_whole,2) )
-      Cut_prob_mat[self.agent_eyesight_1side-3:self.agent_eyesight_1side+4,self.agent_eyesight_1side-3:self.agent_eyesight_1side+4,:] = self.central_sparsity
-      Cut_prob_mat[self.agent_eyesight_1side-1:self.agent_eyesight_1side+2,self.agent_eyesight_1side-1:self.agent_eyesight_1side+2,:] = self.core_sparsity
-      Cut_prob_mat = np.concatenate( [Cut_prob_mat.reshape(-1), [self.sparsity]] )
-
-      self.W_in_s = np.where(Cut_prob_W_in_s < Cut_prob_mat, 0.00, self.W_in_s)
-
-      self.W_in_s = csc_matrix(self.W_in_s)
-
-      self.XXT = self.beta*np.identity(self.reservoir_output_size)
-      self.rX = np.zeros((self.reservoir_output_size,))
-
+      self.total_reward = 0.0
 
    def _step(self, action): # moved from Object._step() (refactor only; behaviors unchanged)
       if action == 0:
@@ -298,37 +191,9 @@ class Agent(Object):
          self.new_pos[1] -= self.height
       #Update of the position itself is executed by Env.step().
 
-   #methods related with reinforcement learning
-   #def _ReLU(self,x):
-   #   return np.maximum(x, 0.0)
-
-   def choose_action(self, state_arr): #epsilon-greedy
-      self.X_in = np.concatenate( [state_arr, np.ones((state_arr.shape[0],1))], axis=1 )
-      Input_state = np.repeat( (self.X_in * self.W_in_s.T)[:,np.newaxis,:], self.action_size, axis=1) # T*a*Nres array
-      X_esn_candidates = np.tanh( Input_state + self.W_in_a.T[np.newaxis,:,:] )
-      self.Q = np.dot( np.concatenate([X_esn_candidates, np.ones((X_esn_candidates.shape[0],self.action_size,1))],axis=2), self.W_out ) #T*a array
-
-      p = np.random.uniform(low=0.0,high=1.0, size = (self.Q.shape[0],))
-      action_argmax = np.argmax(self.Q, axis=1) 
-      action_random = np.random.randint(self.action_size, high=None, size=(self.Q.shape[0],))
-      action_chosen = np.where(p < self.epsilon, action_random, action_argmax)
-      self.X_esn = X_esn_candidates[np.arange(X_esn_candidates.shape[0]),action_chosen,:]
-      return action_chosen, np.concatenate([self.X_esn, np.ones((self.X_esn.shape[0],1))],axis=1) # returns action and corresponding X_res
-
-   def calculate_Wout(self): 
-      reward_array_1 = np.concatenate(self.reward_list, axis=0)
-      Xi_temp_array_1 = np.concatenate(self.Xi_temp_list, axis=0)
-      Xi_temp_p0_array_1 = np.concatenate(self.Xi_temp_p0_list, axis=0)
-      self.rX += np.dot(reward_array_1, Xi_temp_p0_array_1 )
-      self.XXT += np.dot(Xi_temp_array_1.T , Xi_temp_p0_array_1 )
-      XXTinv = np.linalg.inv( self.XXT )
-      self.W_out = np.dot(self.rX,XXTinv)
-      self.rX *= self.decay_ratio
-      self.XXT *= self.decay_ratio
-      self.reward_list = []
-      self.Xi_temp_list = []
-      self.Xi_temp_p0_list = []
-
+   def choose_action(self, n): 
+      action_chosen = np.random.randint(self.action_size, size=(n,))
+      return action_chosen  # returns action only
 
 
 if __name__ == '__main__':
@@ -338,12 +203,12 @@ if __name__ == '__main__':
    ep_termination = hyper.ep_termination
    ep_observe = hyper.ep_observe
 
-   filename_learning_curve = "LC_ELM_tanh_batch_forward_" + str(hyper.n_agent) + "pedestrians_task1_modified_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.reservoir_size) + "_epsilon_" + str(hyper.epsilon_decay) + "to" + str(hyper.epsilon_min) + "_" + str(seed) + "th_try.txt"
-   filename_density = "density_ELM_tanh_batch_forward_" + str(hyper.n_agent) + "pedestrians_task1_modified_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.reservoir_size) + "_epsilon_" + str(hyper.epsilon_decay) + "to" + str(hyper.epsilon_min) + "_" + str(seed) + "th_try.txt"
+   filename_learning_curve = "LC_" + str(hyper.n_agent) + "pedestrians_task1_random_batch_randint_view_" + str(hyper.agent_eyesight_whole) + "_7_3_" + str(seed) + "th_try.txt"
+   filename_density = "density_" + str(hyper.n_agent) + "pedestrians_task1_random_batch_randint_view_" + str(hyper.agent_eyesight_whole) + "_7_3_" + str(seed) + "th_try.txt"
    file_learning_curve = open(filename_learning_curve, "w")
    file_density = open(filename_density, "w")
 
-   filename_time = "time_ELM_tanh_batch_forward_" + str(hyper.n_agent) + "pedestrians_task1_modified_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.reservoir_size) + "_epsilon_" + str(hyper.epsilon_decay) + "to" + str(hyper.epsilon_min) + "_" + str(seed) + "th_try.txt"
+   filename_time = "time_" + str(hyper.n_agent) + "pedestrians_task1_random_batch_randint_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(seed) + "th_try.txt"
    file_time = open(filename_time, "w")
 
    t1 = 0
@@ -387,11 +252,11 @@ if __name__ == '__main__':
    file_density.close()
    
    #gif-animation
-   filename_gif = "animation_ELM_tanh_batch_forward_" + str(hyper.n_agent) + "pedestrians_task1_modified_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.reservoir_size) + "_epsilon_" + str(hyper.epsilon_decay) + "to" + str(hyper.epsilon_min) + "_" + str(seed) + "th_try.gif"
+   filename_gif = "animation_" + str(hyper.n_agent) + "pedestrians_task1_random_batch_randint_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(seed) + "th_try.gif"
    
-   filename_snap1 = "snapshot_ELM_tanh_batch_forward_" + str(hyper.n_agent) + "pedestrians_task1_modified_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.reservoir_size) + "_epsilon_" + str(hyper.epsilon_decay) + "to" + str(hyper.epsilon_min) + "_" + str(seed) + "th_try_t_0.png"
-   filename_snap2 = "snapshot_ELM_tanh_batch_forward_" + str(hyper.n_agent) + "pedestrians_task1_modified_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.reservoir_size) + "_epsilon_" + str(hyper.epsilon_decay) + "to" + str(hyper.epsilon_min) + "_" + str(seed) + "th_try_t_100.png"
-   filename_snap3 = "snapshot_ELM_tanh_batch_forward_" + str(hyper.n_agent) + "pedestrians_task1_modified_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.reservoir_size) + "_epsilon_" + str(hyper.epsilon_decay) + "to" + str(hyper.epsilon_min) + "_t_" + str(t_max-1) + "_" + str(seed) + "th_try.png"
+   filename_snap1 = "snapshot_" + str(hyper.n_agent) + "pedestrians_task1_random_batch_randint_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(seed) + "th_try_t_0.png"
+   filename_snap2 = "snapshot_" + str(hyper.n_agent) + "pedestrians_task1_random_batch_randint_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(seed) + "th_try_t_100.png"
+   filename_snap3 = "snapshot_" + str(hyper.n_agent) + "pedestrians_task1_random_batch_randint_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_t_" + str(t_max-1) + "_" + str(seed) + "th_try.png"
    myEnv._rendermode_change_to_rgb()
    myEnv.done = False
    for t1 in range (t_max):
@@ -406,7 +271,7 @@ if __name__ == '__main__':
    myEnv.agents[0].total_reward = 0.0
 
    #density plot
-   filename_colormap = "colormap_ELM_tanh_batch_forward_" + str(hyper.n_agent) + "pedestrians_task1_modified_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.reservoir_size) + "_epsilon_" + str(hyper.epsilon_decay) + "to" + str(hyper.epsilon_min) + "_" + str(seed) + "th_try.png"
+   filename_colormap = "colormap_" + str(hyper.n_agent) + "pedestrians_task1_random_batch_randint_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(seed) + "th_try.png"
    mean_view_3ch = np.concatenate( [mean_view, np.zeros((myEnv.width,myEnv.height,1))], axis=2 ).transpose(1,0,2)
    mean_view_3ch = (255.0*mean_view_3ch).astype(np.uint8)
    mean_view_3ch[:,:,2] = np.where(mean_view_3ch[:,:,1] == 0, 255 - mean_view_3ch[:,:,0], 0)

@@ -2,14 +2,16 @@
 Source code for task.I using A2C
 2025/9/29 improved the forward propagation to save the computational time
 2025/10/8 employed logits instead of probs in choose_action
+2025/12/26 changed the advantage trajectory into ndarray
+2025/1/5 introduced next_state calculation
+2026/1/6 introduced inference_mode()
+2026/1/6 use inference_mode during exploring
+2026/1/13 introduced "return_action" to the forward propagation
 """
 import numpy as np
 import time
-import os
 import copy
-from PIL import Image, ImageDraw
-from collections import namedtuple
-from collections import deque
+from PIL import Image
 
 import torch
 from torch import nn
@@ -17,16 +19,15 @@ import torch.nn.functional as torF
 from torch.distributions import Categorical
 
 start_time = time.time()
-np.set_printoptions(precision=3)
+#np.set_printoptions(precision=3) # used for debugging
 
 seed = 1
-np.random.seed(seed)
-torch.cuda.manual_seed_all(seed)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+if torch.cuda.is_available():
+   torch.cuda.manual_seed_all(seed)
+   torch.backends.cudnn.deterministic = True
+   torch.backends.cudnn.benchmark = False
 torch.manual_seed(seed)
 
-currentdir = os.getcwd()
 global condition_dict
 condition_dict = {"vacant":0, "wall":1, "agent":2}
 
@@ -38,7 +39,7 @@ class hyperparameters:
       self.ep_observe = 150
       self.width = 30
       self.height = 25
-      self.n_agent = 12 #the number of agents
+      self.n_agent = 1 #the number of agents
       self.agent_eyesight_whole = 11 #odd number
 
       self.gamma = 0.95
@@ -50,20 +51,11 @@ class hyperparameters:
       self.value_loss_coef = 0.5
       self.max_grad_norm = 50.0
 
-def Adjacent(pos1,pos2):
-   if abs(pos1[0]-pos2[0]) == 1 and abs(pos1[1]-pos2[1]) == 0:
-      return True
-   if abs(pos1[0]-pos2[0]) == 0 and abs(pos1[1]-pos2[1]) == 1:
-      return True
-   else:
-      return False
 
 class Env:
-   def __init__(self, hyperparameters, render_mode='off', experience_sharing='on'):
-      #render_mode : 'off', 'CUI', or 'rgb_array'
+   def __init__(self, hyperparameters, render_mode='off'):
+      #render_mode : 'off' or 'rgb_array'
       self.render_mode = render_mode
-      # experience_sharing : 'on' or 'off' ... It means whether parameter sharing is adopted or not.
-      self.experience_sharing = experience_sharing
       if self.render_mode == 'rgb_array' :
          self.Image_list = []
 
@@ -72,11 +64,9 @@ class Env:
       self.hyperparameters = hyperparameters
       self.width = self.hyperparameters.width
       self.height = self.hyperparameters.height
-      self.area = self.width*self.height
       self.condition = np.zeros((self.width,self.height), dtype=int).tolist()
       self.view = np.zeros((self.width,self.height,2))
       self.move_candidate_number = np.zeros((self.width,self.height)).astype(int)
-      self.pos_to_object = [[None for i in range(self.height)] for j in range(self.width)]
       self.n_agent = self.hyperparameters.n_agent
       self.done = False
       
@@ -92,10 +82,9 @@ class Env:
       self.net = Net(hyperparameters=self.hyperparameters)
       self.optimizer = torch.optim.Adam(self.net.parameters(), lr=self.learning_rate)
 
-      self.whole_mem_values = []
-      self.whole_R_values = np.zeros( (0,1) )
-      self.whole_mem_log_probs = []
-      self.whole_mem_entropies = []
+      self.whole_mem_states = []
+      self.whole_mem_actions = []
+      self.whole_R_values = []
 
       for i_agent in range(self.n_agent):
          pos_temp_agent = self.agent_position(i_agent)
@@ -105,9 +94,10 @@ class Env:
             new_agent = copy.deepcopy(self.agents[0])
             new_agent.pos = pos_temp_agent
          self.agents.append(new_agent)
-         self.pos_to_object[new_agent.pos[0]][new_agent.pos[1]] = new_agent
          self.condition[new_agent.pos[0]][new_agent.pos[1]] = condition_dict["agent"]
          self.view[new_agent.pos[0]][new_agent.pos[1]][0] = self.agents[i_agent].color
+
+      self.agents[0].make_eyesight()
 
    def agent_position(self, i_agent):
       if i_agent <= 19 :
@@ -118,7 +108,6 @@ class Env:
    def build_wall(self):
       if self.walls: 
          for w1 in self.walls:
-            self.pos_to_object[w1.pos[0]][w1.pos[1]] = w1
             self.view[w1.pos[0]][w1.pos[1]][1] = w1.color
             self.condition[w1.pos[0]][w1.pos[1]] = condition_dict["wall"]
       else:
@@ -138,9 +127,8 @@ class Env:
                   self.set_wall(x,y)
 
    def set_wall(self,x,y):
-      new_wall = Object(x,y, self.condition, kind=("wall"), hyperparameters=self.hyperparameters)
+      new_wall = Object(x,y, self.condition, kind=("wall"))
       self.walls.append(new_wall)
-      self.pos_to_object[x][y] = new_wall
       self.view[x][y][1] = new_wall.color
 
    def reset(self):
@@ -148,44 +136,38 @@ class Env:
       self.condition = np.zeros((self.width,self.height), dtype=int).tolist()
       self.view = np.zeros((self.width,self.height,2))
       self.move_candidate_number = np.zeros((self.width,self.height)).astype(int)
-      self.pos_to_object = [[None for i in range(self.height)] for j in range(self.width)]
       self.done = False
       self.build_wall()
       for i_agent in range(self.n_agent):
          pos_temp_agent = self.agent_position(i_agent)
          self.agents[i_agent].pos = pos_temp_agent
          self.agents[i_agent].total_reward = 0.0
-         self.pos_to_object[self.agents[i_agent].pos[0]][self.agents[i_agent].pos[1]] = self.agents[i_agent]
          self.condition[self.agents[i_agent].pos[0]][self.agents[i_agent].pos[1]] = condition_dict["agent"]
          self.view[self.agents[i_agent].pos[0]][self.agents[i_agent].pos[1]][0] = self.agents[i_agent].color
 
 
    def _step(self, t):
       #agents' action
-      state_list = []
-      for i_agent in range(self.n_agent):
-         action=[0,0]
-         #self.agents[i_agent]._key_step(self.pos_to_object)
-         
-         if self.agents[i_agent].dead_or_alive == 'alive':
-            delx = self.agents[i_agent].agent_eyesight_1side - self.agents[i_agent].pos[0]
-            dely = self.agents[i_agent].agent_eyesight_1side - self.agents[i_agent].pos[1]
-            state = np.roll(np.roll(self.view, delx, axis=0), dely, axis=1)[0:self.agents[i_agent].agent_eyesight_whole, 0:self.agents[i_agent].agent_eyesight_whole, :]
-         else:
-            state = np.zeros( (self.agents[i_agent].agent_eyesight_whole,self.agents[i_agent].agent_eyesight_whole,2) )
-         state = torch.from_numpy(state)
-         state_list.append(state)
+      if t == 0:
+         # getting batched observation 
+         whole_pos_x = np.array([agent.pos[0] for agent in self.agents]) 
+         whole_pos_y = np.array([agent.pos[1] for agent in self.agents]) 
+         x_id_batch = (whole_pos_x[:, None] + self.agents[0].offset[None, :]) % self.width
+         y_id_batch = (whole_pos_y[:, None] + self.agents[0].offset[None, :]) % self.height
+         state_tensor = torch.from_numpy(self.view[x_id_batch[:, :, None], y_id_batch[:, None, :]]).float().flatten(1) # preprocess the observtion previously
+      else:
+         state_tensor = self.next_state_tensor
 
-      state_tensor = torch.stack(state_list)
-      whole_action, whole_log_prob, whole_entropy, whole_value = self.net.forward( state_tensor ) 
+      with torch.inference_mode():
+         whole_action = self.net.forward( state_tensor, return_action=True ) 
 
       for i_agent in range(self.n_agent):
          self.agents[i_agent].action = whole_action[i_agent:i_agent+1]
-         self.agents[i_agent].log_prob = whole_log_prob[i_agent:i_agent+1]
-         self.agents[i_agent].entropy = whole_entropy[i_agent:i_agent+1]
-         self.agents[i_agent].value = whole_value[i_agent:i_agent+1]
-         self.agents[i_agent]._step(self.agents[i_agent].action.item(), self.pos_to_object)
+         self.agents[i_agent]._step(self.agents[i_agent].action.item())
          self.move_candidate_number[self.agents[i_agent].new_pos[0]][self.agents[i_agent].new_pos[1]] += 1            
+
+         self.agents[i_agent].memory_states.append(state_tensor[i_agent])
+         self.agents[i_agent].memory_actions.append(self.agents[i_agent].action)
          
       #update of the positions of agents
       for i_agent in range(self.n_agent):
@@ -199,8 +181,6 @@ class Env:
             self.condition[self.agents[i_agent].new_pos[0]][self.agents[i_agent].new_pos[1]] = condition_dict[self.agents[i_agent].kind]
             self.view[self.agents[i_agent].pos[0]][self.agents[i_agent].pos[1]][0] = 0.0
             self.view[self.agents[i_agent].new_pos[0]][self.agents[i_agent].new_pos[1]][0] = self.agents[i_agent].color
-            self.pos_to_object[self.agents[i_agent].pos[0]][self.agents[i_agent].pos[1]] = None
-            self.pos_to_object[self.agents[i_agent].new_pos[0]][self.agents[i_agent].new_pos[1]] = self.agents[i_agent]
             self.agents[i_agent].reward = self.agents[i_agent].reward_candidate
             self.agents[i_agent].pos = self.agents[i_agent].new_pos
          else:
@@ -210,55 +190,51 @@ class Env:
          self.agents[i_agent].total_reward += self.agents[i_agent].reward
          self.agents[i_agent].move_permission = 'no'
 
-         #update of memory matrices...deleted
-
-         self.agents[i_agent].memory_values.append(self.agents[i_agent].value)
-         self.agents[i_agent].memory_log_probs.append(self.agents[i_agent].log_prob)
          self.agents[i_agent].memory_rewards.append(self.agents[i_agent].reward)
-         self.agents[i_agent].memory_entropies.append(self.agents[i_agent].entropy)
          self.agents[i_agent].memory_dones.append(self.done)
 
+      # getting batched observation 
+      whole_pos_x = np.array([agent.pos[0] for agent in self.agents]) 
+      whole_pos_y = np.array([agent.pos[1] for agent in self.agents]) 
+      x_id_batch = (whole_pos_x[:, None] + self.agents[0].offset[None, :]) % self.width
+      y_id_batch = (whole_pos_y[:, None] + self.agents[0].offset[None, :]) % self.height
+      self.next_state_tensor = torch.from_numpy(self.view[x_id_batch[:, :, None], y_id_batch[:, None, :]]).float().flatten(1)
+
       if self.done or (t+1)%self.num_step ==0 :
-         state_list = []
-         for i_agent in range(self.n_agent):
-            #calculation on the last step
-            delx = self.agents[i_agent].agent_eyesight_1side - self.agents[i_agent].pos[0]
-            dely = self.agents[i_agent].agent_eyesight_1side - self.agents[i_agent].pos[1]
-            state = np.roll(np.roll(self.view, delx, axis=0), dely, axis=1)[0:self.agents[i_agent].agent_eyesight_whole, 0:self.agents[i_agent].agent_eyesight_whole, :]
-            state = torch.from_numpy(state)
-            state_list.append(state)
-
-         state_tensor = torch.stack(state_list)
-         with torch.no_grad():
-            _, _, _, whole_R_temp = self.net.forward( state_tensor ) 
+         with torch.inference_mode():
+            whole_R_temp = self.net.forward( self.next_state_tensor, return_action=False ).tolist() 
 
          for i_agent in range(self.n_agent):
-            R_temp = whole_R_temp[i_agent].detach().item()
-            self.agents[i_agent].R_values = np.zeros( (len(self.agents[i_agent].memory_values),1) )
+            R_temp = whole_R_temp[i_agent]
+            len_mem = len(self.agents[i_agent].memory_rewards)
+            self.agents[i_agent].R_values = np.zeros( (len_mem, 1) )
 
-            for i_rev_step in reversed( range(len(self.agents[i_agent].memory_values)) ):
-                R_temp = self.agents[i_agent].memory_rewards[i_rev_step] + self.gamma * R_temp*(1.0-self.agents[i_agent].memory_dones[i_rev_step])
-                self.agents[i_agent].R_values[i_rev_step] = R_temp
+            for i_rev_step in reversed( range(len_mem) ):
+               R_temp = self.agents[i_agent].memory_rewards[i_rev_step] + self.gamma * R_temp*(1.0-self.agents[i_agent].memory_dones[i_rev_step])
+               self.agents[i_agent].R_values[i_rev_step] = R_temp
 
-            self.whole_mem_values += self.agents[i_agent].memory_values
-            self.whole_R_values = np.concatenate((self.whole_R_values, self.agents[i_agent].R_values),axis=0)
-            self.whole_mem_log_probs += self.agents[i_agent].memory_log_probs
-            self.whole_mem_entropies += self.agents[i_agent].memory_entropies
+            self.whole_mem_states += self.agents[i_agent].memory_states
+            self.whole_mem_actions += self.agents[i_agent].memory_actions
+            self.whole_R_values.append(torch.from_numpy(self.agents[i_agent].R_values))
 
-         self.whole_advantage = torch.Tensor(self.whole_R_values) - torch.stack(self.whole_mem_values)
+         tensor_mem_states = torch.stack(self.whole_mem_states)
+         tensor_mem_actions = torch.stack(self.whole_mem_actions)
+         tensor_mem_Rs = torch.cat( self.whole_R_values, dim=0).float()
+
+         log_prob_new, entropy_new, value_new = self.net.new_probs(tensor_mem_states, tensor_mem_actions)   
+         self.whole_advantage = (tensor_mem_Rs - value_new)
 
          self.value_loss = torch.mean( self.whole_advantage.pow(2) ) 
-         self.policy_loss = torch.mean( -torch.stack(self.whole_mem_log_probs)*self.whole_advantage.detach() - self.entropy_coef * torch.stack(self.whole_mem_entropies) )
+         self.policy_loss = torch.mean( -log_prob_new*self.whole_advantage.detach() - self.entropy_coef * entropy_new )
 
          self.optimizer.zero_grad()
          (self.policy_loss + self.value_loss_coef * self.value_loss).backward()
          nn.utils.clip_grad_norm_(self.net.parameters(), self.max_grad_norm)
          self.optimizer.step()
 
-         self.whole_mem_values = []
-         self.whole_R_values = np.zeros( (0,1) )
-         self.whole_mem_log_probs = []
-         self.whole_mem_entropies = []
+         self.whole_mem_states = []
+         self.whole_mem_actions = []
+         self.whole_R_values = []
 
          for i_agent in range(self.n_agent):
             self.agents[i_agent].memory_clear()
@@ -267,69 +243,43 @@ class Env:
       self.move_candidate_number = np.zeros((self.width,self.height)).astype(int)
 
    def _render(self):
-      if self.render_mode == 'CUI' :
-         for j in range(self.height):
-            for i in range(self.width):
-               if self.condition[i][j] == condition_dict["agent"] :
-                  print("A", end="")
-               elif self.condition[i][j] == condition_dict["wall"] :
-                  print("X", end="")
-               else:
-                  print(" ", end="")
-            print()
-         print(self.agents[0].reward, self.agents[1].reward)
-      elif self.render_mode == 'rgb_array' :
+      if self.render_mode == 'rgb_array' :
          view_3ch = np.concatenate( [self.view, np.zeros((self.width,self.height,1))], axis=2 ).transpose(1,0,2)
          view_3ch = np.maximum( 255.0*np.minimum( view_3ch, np.ones(view_3ch.shape) ), np.zeros(view_3ch.shape) ).astype(np.uint8)
          self.Image_list.append( Image.fromarray( np.repeat(np.repeat(view_3ch,5,axis=0),5,axis=1) ) )
-      elif self.render_mode == 'off' :
-         pass
 
    def _rendermode_change_to_rgb(self):
       self.render_mode = 'rgb_array'
       self.Image_list = []
 
 class Object:
-   def __init__(self,x,y,condition, kind, hyperparameters):
-      self.hyperparameters = hyperparameters
-      self.action_space = [0,0] 
-      self.v = 1
-      self.vskew = 1
-      self.width = self.hyperparameters.width
-      self.height = self.hyperparameters.height
+   def __init__(self,x,y,condition, kind):
       self.kind = kind
-      self.define_orientation = {"left":0, "right":1}
-      self.orientation = 0
-      self.attack_switch = 0     
-      self.attack_existence = False
-      self.agent_eyesight_whole = hyperparameters.agent_eyesight_whole 
-      self.agent_eyesight_1side = self.agent_eyesight_whole//2
-
-      self.attacked_count = 0
-      self.attacker = []
-      self.move_permission = 'no'
-
       self.pos = np.array([x,y])
       self.color = 1.0
       condition[self.pos[0]][self.pos[1]] = condition_dict[kind]
 
-   def _key_step(self,pos_to_object):
-      print("Choose 'u','d','r', 'l', 'au', 'ad', 'ar', or 'al':")
-      key_command = input()
-      if key_command == 'u':
-         action = 0
-      elif key_command == 'd':
-         action = 1
-      elif key_command == 'r':
-         action = 2
-      elif key_command == 'l':
-         action = 3
-      else:
-         action = 0
-      self._step(action,pos_to_object)
 
-   def _step(self, action, pos_to_object):
-      #action[0]...direction of the movement, action[1]:attacking
+class Agent(Object):
+   def __init__(self,x,y,condition, kind, hyperparameters):
+      super().__init__(x,y,condition, kind)
+      self.hyperparameters = hyperparameters
+      self.width = self.hyperparameters.width
+      self.height = self.hyperparameters.height
+      self.move_permission = 'no'
+      self.total_reward = 0.0
+
+      self.memory_states = []
+      self.memory_actions = []
+      self.memory_rewards = []
+      self.memory_dones = []
+
+   def make_eyesight(self): # lazy initialization for particular agents' attribute
+      self.agent_eyesight_whole = self.hyperparameters.agent_eyesight_whole 
+      self.agent_eyesight_1side = self.agent_eyesight_whole//2
+      self.offset = np.arange(-self.agent_eyesight_1side, self.agent_eyesight_1side + 1)
+
+   def _step(self, action): # moved from Object._step() (refactor only; behaviors unchanged)
       if action == 0:
          direction = np.array([1,0])
       elif action == 1:
@@ -350,52 +300,12 @@ class Object:
       elif self.new_pos[1] >= self.height:
          self.new_pos[1] -= self.height
       #Update of the position itself is executed by Env.step().
-
-class Agent(Object):
-   def __init__(self,x,y,condition, kind, hyperparameters):
-      super().__init__(x,y,condition, kind, hyperparameters)
-
-      self.total_reward = 0.0
-      self.reward = 0.0
-      self.eaten_foods = 0
-      self.dead_or_alive = 'alive'
-
-      self.memory_log_probs = []
-      self.memory_entropies = []
-      self.memory_values = []
-      self.memory_rewards = []
-      self.memory_dones = []
-
-      self.value = torch.zeros(1, 1)
-      self.entropy = torch.zeros(1, 1)
-      self.log_prob = torch.zeros(1, 1)
-      self.R = torch.zeros(1, 1)
-      self.advantage = torch.zeros(1, 1)
-
-   def memory_append(self, log_prob, entropy, value, reward, done):
-      self.memory_log_probs.append(log_prob)
-      self.memory_entropies.append(entropy)
-      self.memory_values.append(value)
-      self.memory_rewards.append(reward)
-      self.memory_dones.append(done)
     
    def memory_clear(self):
-      self.memory_log_probs.clear()
-      self.memory_entropies.clear()
-      self.memory_values.clear()
-      self.memory_rewards.clear()
-      self.memory_dones.clear()  
-
-   def _zip(self):
-      return zip(self.memory_log_probs, self.memory_entropies, self.memory_values, self.memory_rewards, self.memory_dones)
-
-   def load_data(self):
-      for data in self._zip():
-         return data
-    
-   def memory_reversed(self):
-      for data in list(self._zip())[::-1]:
-         yield data
+      self.memory_states = []
+      self.memory_actions = []
+      self.memory_rewards = []
+      self.memory_dones = []   
 
 
 class Net(nn.Module):
@@ -404,23 +314,30 @@ class Net(nn.Module):
       self.hyperparameters = hyperparameters
       self.state_size = 2*self.hyperparameters.agent_eyesight_whole**2
       self.action_size = 4
-      self.action_choice = [_ for _ in range (self.action_size)] 
       self.layer_size = self.hyperparameters.layer_size
 
       self.fc1 = nn.Linear(self.state_size, self.layer_size)
       self.fc2_policy = nn.Linear(self.layer_size, self.action_size)
       self.fc2_value = nn.Linear(self.layer_size, 1)
 
+   def forward(self, x, return_action):
+      u = torF.relu(self.fc1(x))
+      if return_action:
+         logits = self.fc2_policy(u)
+         probs = Categorical(logits=logits)
+         action = probs.sample()
+         return action
+      else:
+         value = self.fc2_value(u)
+         return torch.squeeze(value,1)
 
-   def forward(self, x):
-      x = x.float()
-      u = torch.flatten(x, 1) # flatten all dimensions except batch
-      u = torF.relu(self.fc1(u))
+   def new_probs(self, x, a):
+      u = torF.relu(self.fc1(x))
       logits = self.fc2_policy(u)
       value = self.fc2_value(u)
       probs = Categorical(logits=logits)
-      action = probs.sample()
-      return action, probs.log_prob(action), probs.entropy(), torch.squeeze(value,1)
+      log_prob = probs.log_prob(a.long().squeeze(-1))
+      return torch.unsqueeze(log_prob,dim=1), torch.unsqueeze(probs.entropy(),dim=1), value
 
 
 if __name__ == '__main__':
@@ -430,12 +347,12 @@ if __name__ == '__main__':
    ep_termination = hyper.ep_termination
    ep_observe = hyper.ep_observe
 
-   filename_learning_curve = "LC_A2C_logit_batch_forward_" + str(hyper.n_agent) + "pedestrians_task1_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.layer_size) + "_lr_" + str(hyper.learning_rate) + "_numstep_" + str(hyper.num_step) + "_" + str(seed) + "th_try.txt"
-   filename_density = "density_A2C_logit_batch_forward_" + str(hyper.n_agent) + "pedestrians_task1_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.layer_size) + "_lr_" + str(hyper.learning_rate) + "_numstep_" + str(hyper.num_step) + "_" + str(seed) + "th_try.txt"
+   filename_learning_curve = "LC_A2C_logit_bf_stack_nogr_infe_" + str(hyper.n_agent) + "pedestrians_task1_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.layer_size) + "_lr_" + str(hyper.learning_rate) + "_numstep_" + str(hyper.num_step) + "_" + str(seed) + "th_try.txt"
+   filename_density = "density_A2C_logit_bf_stack_nogr_infe_" + str(hyper.n_agent) + "pedestrians_task1_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.layer_size) + "_lr_" + str(hyper.learning_rate) + "_numstep_" + str(hyper.num_step) + "_" + str(seed) + "th_try.txt"
    file_learning_curve = open(filename_learning_curve, "w")
    file_density = open(filename_density, "w")
 
-   filename_time = "time_A2C_logit_batch_forward_" + str(hyper.n_agent) + "pedestrians_task1_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.layer_size) + "_lr_" + str(hyper.learning_rate) + "_numstep_" + str(hyper.num_step) + "_" + str(seed) + "th_try.txt"
+   filename_time = "time_A2C_logit_bf_stack_nogr_infe_" + str(hyper.n_agent) + "pedestrians_task1_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.layer_size) + "_lr_" + str(hyper.learning_rate) + "_numstep_" + str(hyper.num_step) + "_" + str(seed) + "th_try.txt"
    file_time = open(filename_time, "w")
 
    t1 = 0
@@ -444,7 +361,6 @@ if __name__ == '__main__':
    mean_view = np.zeros((myEnv.width,myEnv.height,2))
    var_view = np.zeros((myEnv.width,myEnv.height,2))
    mean_count = 0.0
-   #print( myEnv.condition[myEnv.agents[0].pos[0]][myEnv.agents[0].pos[1]] )
    for n_episode in range (ep_termination):
       myEnv.done = False
       for t1 in range (t_max):
@@ -480,17 +396,16 @@ if __name__ == '__main__':
    file_density.close()
    
    #gif-animation
-   filename_gif = "animation_A2C_logit_batch_forward_" + str(hyper.n_agent) + "pedestrians_task1_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.layer_size) + "_lr_" + str(hyper.learning_rate) + "_numstep_" + str(hyper.num_step) + "_" + str(seed) + "th_try.gif"
+   filename_gif = "animation_A2C_logit_bf_stack_nogr_infe_" + str(hyper.n_agent) + "pedestrians_task1_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.layer_size) + "_lr_" + str(hyper.learning_rate) + "_numstep_" + str(hyper.num_step) + "_" + str(seed) + "th_try.gif"
    
-   filename_snap1 = "snapshot_A2C_logit_batch_forward_" + str(hyper.n_agent) + "pedestrians_task1_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.layer_size) + "_lr_" + str(hyper.learning_rate) + "_numstep_" + str(hyper.num_step) + "_t_0_" + str(seed) + "th_try.png"
-   filename_snap2 = "snapshot_A2C_logit_batch_forward_" + str(hyper.n_agent) + "pedestrians_task1_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.layer_size) + "_lr_" + str(hyper.learning_rate) + "_numstep_" + str(hyper.num_step) + "_t_100_" + str(seed) + "th_try.png"
-   filename_snap3 = "snapshot_A2C_logit_batch_forward_" + str(hyper.n_agent) + "pedestrians_task1_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.layer_size) + "_lr_" + str(hyper.learning_rate) + "_numstep_" + str(hyper.num_step) + "_t_" + str(t_max-1) + "_" + str(seed) + "th_try.png"
+   filename_snap1 = "snapshot_A2C_logit_bf_stack_nogr_infe_" + str(hyper.n_agent) + "pedestrians_task1_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.layer_size) + "_lr_" + str(hyper.learning_rate) + "_numstep_" + str(hyper.num_step) + "_t_0_" + str(seed) + "th_try.png"
+   filename_snap2 = "snapshot_A2C_logit_bf_stack_nogr_infe_" + str(hyper.n_agent) + "pedestrians_task1_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.layer_size) + "_lr_" + str(hyper.learning_rate) + "_numstep_" + str(hyper.num_step) + "_t_100_" + str(seed) + "th_try.png"
+   filename_snap3 = "snapshot_A2C_logit_bf_stack_nogr_infe_" + str(hyper.n_agent) + "pedestrians_task1_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.layer_size) + "_lr_" + str(hyper.learning_rate) + "_numstep_" + str(hyper.num_step) + "_t_" + str(t_max-1) + "_" + str(seed) + "th_try.png"
    myEnv._rendermode_change_to_rgb()
    myEnv.done = False
    for t1 in range (t_max):
       myEnv._render()
       myEnv._step(t1)
-      #time.sleep(0.5)
    if myEnv.render_mode == 'rgb_array':
       myEnv.Image_list[0].save(filename_gif, save_all=True, append_images=myEnv.Image_list[1:], optimize=False, duration=200, loop=0)
       myEnv.Image_list[0].save(filename_snap1)
@@ -500,7 +415,7 @@ if __name__ == '__main__':
    myEnv.agents[0].total_reward = 0.0
 
    #density plot
-   filename_colormap = "colormap_A2C_logit_batch_forward_" + str(hyper.n_agent) + "pedestrians_task1_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.layer_size) + "_lr_" + str(hyper.learning_rate) + "_numstep_" + str(hyper.num_step) + "_" + str(seed) + "th_try.png"
+   filename_colormap = "colormap_A2C_logit_bf_stack_nogr_infe_" + str(hyper.n_agent) + "pedestrians_task1_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.layer_size) + "_lr_" + str(hyper.learning_rate) + "_numstep_" + str(hyper.num_step) + "_" + str(seed) + "th_try.png"
    mean_view_3ch = np.concatenate( [mean_view, np.zeros((myEnv.width,myEnv.height,1))], axis=2 ).transpose(1,0,2)
    mean_view_3ch = (255.0*mean_view_3ch).astype(np.uint8)
    mean_view_3ch[:,:,2] = np.where(mean_view_3ch[:,:,1] == 0, 255 - mean_view_3ch[:,:,0], 0)
