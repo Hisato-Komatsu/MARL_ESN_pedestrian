@@ -35,6 +35,7 @@ uplaoded DRL codes used for comparison of performance.
 # Notes on Reproducibility
 
 One hyperparameter was omitted in the paper:
+
 update frequency of DQN per one environmental step = 1
 
 
