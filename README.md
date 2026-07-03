@@ -12,9 +12,30 @@ Whether parameter sharing is adopted or not is decided by Env.experience_sharing
 
 # updates
 
-2024/03/22 modified inefficient calculations.
+Note: The dates in the directory names reflect the date when the erratum was submitted to the journal.
 
-2024/03/22 uplaoded DRL codes used for comparison of performance.
+-2026/02/23
+Modified the codes in the following directory to improve efficiency:  
+erratum_Sec3_Dec22_2025
+
+-2025/12/25
+Uploaded modified codes for the Erratum correcting inefficient processes. 
+Directory: erratum_Sec3_Dec22_2025.
+
+-2025/12/24
+Uploaded modified codes for the Erratum mainly correcting the non-standard algorithm.
+Directory: erratum_Sec1and2_Dec22_2025
+
+-2024/03/22
+modified inefficient calculations.
+
+-2024/03/22
+uplaoded DRL codes used for comparison of performance.
+
+# Notes on Reproducibility
+
+One hyperparameter was omitted in the paper:
+update frequency of DQN per one environmental step = 1
 
 
 # Credits
